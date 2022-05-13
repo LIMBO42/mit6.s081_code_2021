@@ -5,6 +5,11 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
+
 
 struct spinlock tickslock;
 uint ticks;
@@ -27,6 +32,115 @@ void
 trapinithart(void)
 {
   w_stvec((uint64)kernelvec);
+}
+
+
+/**
+ * @brief mmap_handler 处理mmap惰性分配导致的页面错误
+ * @param va 页面故障虚拟地址
+ * @param cause 页面故障原因
+ * @return 0成功，-1失败
+ */
+
+int mmap_handler(int va, int scause)
+{
+  int i;
+  struct proc* p = myproc();
+  //去找属于mmap映射的哪块文件
+  for(i = 0; i < NVMA; ++i) {
+    if(p->vma[i].used && p->vma[i].addr <= va && va <= p->vma[i].addr + p->vma[i].len - 1) {
+      break;
+    }
+  }
+  if(i == NVMA)
+    return -1;
+  int pte_flags = PTE_U;
+  if(p->vma[i].prot & PROT_READ) pte_flags |= PTE_R;
+  if(p->vma[i].prot & PROT_WRITE) pte_flags |= PTE_W;
+  if(p->vma[i].prot & PROT_EXEC) pte_flags |= PTE_X;
+  struct file* vf = p->vma[i].vfile;
+  // 读导致的页面错误
+  if(scause == 13 && vf->readable == 0) return -1;
+  // 写导致的页面错误
+  if(scause == 15 && vf->writable == 0) return -1;
+
+  //分配物理页面
+  void* pa = kalloc();
+  if(pa == 0)
+    return -1;
+  memset(pa, 0, PGSIZE);
+
+  // 读取文件内容
+  ilock(vf->ip);
+
+  // 计算当前页面读取文件的偏移量，实验中p->vma[i].offset总是0
+  
+  //计算第几页
+  int offset = p->vma[i].offset + PGROUNDDOWN(va - p->vma[i].addr);
+  //读进pa
+  int readbytes = readi(vf->ip, 0, (uint64)pa, offset, PGSIZE);
+  // 什么都没有读到
+  if(readbytes == 0) {
+    iunlock(vf->ip);
+    kfree(pa);
+    return -1;
+  }
+  iunlock(vf->ip);
+
+  //这里的处理是缺页一次就映射一页
+  // 添加页面映射
+  if(mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)pa, pte_flags) != 0) {
+    kfree(pa);
+    return -1;
+  }
+
+  return 0;
+}
+
+//删除指定范围的映射
+//unmap addr len
+uint64
+sys_munmap(void) {
+  uint64 addr;
+  int length;
+  if(argaddr(0, &addr) < 0 || argint(1, &length) < 0)
+    return -1;
+  
+  int i;
+  struct proc* p = myproc();
+  for(i = 0; i < NVMA; ++i) {
+    if(p->vma[i].used && p->vma[i].len >= length) {
+      // 根据提示，munmap的地址范围只能是起始和结束的位置
+      // 1. 起始位置
+      if(p->vma[i].addr == addr) {
+        p->vma[i].addr += length;
+        p->vma[i].len -= length;
+        break;
+      }
+      // 2. 结束位置
+      if(addr + length == p->vma[i].addr + p->vma[i].len) {
+        p->vma[i].len -= length;
+        break;
+      }
+    }
+  }
+  if(i == NVMA)
+    return -1;
+  // 将MAP_SHARED页面写回文件系统
+  if(p->vma[i].flags == MAP_SHARED && (p->vma[i].prot & PROT_WRITE) != 0) {
+    filewrite(p->vma[i].vfile, addr, length);
+  }
+
+  // 判断此页面是否存在映射
+  uvmunmap(p->pagetable, addr, length / PGSIZE, 1);
+
+
+  // 当前VMA中全部映射都被取消
+  if(p->vma[i].len == 0) {
+    fileclose(p->vma[i].vfile);
+    p->vma[i].used = 0;
+  }
+  return 0;
 }
 
 //
@@ -67,7 +181,17 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else {
+  }else if(r_scause()==13||r_scause()==15){
+    #ifdef LAB_MMAP
+    //获取产生fault的虚拟地址判断是否位于有效区间
+    uint64 fault_va = r_stval();
+    if(PGROUNDUP(p->trapframe->sp) - 1 < fault_va && fault_va < p->sz) {
+      if(mmap_handler(r_stval(), r_scause()) != 0) p->killed = 1;
+    } else
+      p->killed = 1;
+    #endif
+  } 
+  else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     p->killed = 1;

@@ -82,6 +82,21 @@ struct trapframe {
 
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
+#define NVMA 16
+
+//虚拟内存
+//用来存储mmap的相关信息
+struct vm_area{
+  int used;
+  uint64 addr;  //起始地址
+  int len;      //长度
+  int prot;     //权限
+  int flags;    
+  int vfd;
+  struct file* vfile;
+  int offset;
+};
+
 // Per-process state
 struct proc {
   struct spinlock lock;
@@ -105,4 +120,6 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  struct vm_area vma[NVMA];    //存储vm映射关系的数组
 };
